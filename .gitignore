@@ -6,7 +6,11 @@ yarn.lock
 
 # Environment
 .env
-.env.*
+.env.local
+.env.development
+.env.production
+# Keep .env.example (safe to commit)
+!.env.example
 
 # Build outputs
 dist/

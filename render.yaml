@@ -1,0 +1,28 @@
+# Render Blueprint - Auto-deploy configuration
+# https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: chat-middleware
+    runtime: node
+    plan: free  # Change to 'starter' or 'standard' for production
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000  # Render uses port 10000 internally
+      - key: CORS_ORIGIN
+        sync: false   # Set manually in Render dashboard
+      - key: N8N_WEBHOOK_URL
+        sync: false   # Set manually in Render dashboard
+      - key: DATABASE_URL
+        sync: false   # Set manually in Render dashboard (use Supabase URL)
+      - key: API_SECRET
+        sync: false   # Set manually in Render dashboard
+      - key: HEARTBEAT_TIMEOUT_SECONDS
+        value: 60
+      - key: SESSION_CLOSE_MINUTES
+        value: 2
