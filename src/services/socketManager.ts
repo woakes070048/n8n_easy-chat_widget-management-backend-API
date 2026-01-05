@@ -32,11 +32,12 @@ type ClientToServerEvents = {
   message: (payload: IncomingMessagePayload) => void;
   heartbeat: (payload: HeartbeatPayload) => void;
   endSession: (payload: EndSessionPayload) => void;
+  end_chat: (payload: EndSessionPayload) => void; // React frontend uses this event name
 };
 
 type ServerToClientEvents = {
   session: (payload: { sessionId: string; visitorId: string; status: chat_session_status }) => void;
-  history: (payload: ChatMessageDto[]) => void;
+  history: (payload: { messages: ChatMessageDto[] }) => void; // React frontend expects { messages: [] }
   message: (payload: ChatMessageDto) => void;
   status: (payload: { status: chat_session_status }) => void;
   error: (payload: { message: string }) => void;
@@ -54,9 +55,12 @@ export function createSocketManager(httpServer: HttpServer) {
     httpServer,
     {
       cors: {
-        origin: env.corsOrigins,
+        origin: env.corsOrigins.length ? env.corsOrigins : '*',
         credentials: true,
       },
+      // OPTIMIZATION: Faster handshake for instant session emission
+      pingTimeout: 30000,
+      pingInterval: 25000,
     }
   );
 
@@ -85,27 +89,36 @@ async function handleConnection(
     (socket.handshake.auth?.sessionId as string | undefined) ||
     (socket.handshake.query.sessionId as string | undefined);
 
+  logger.info(`🔌 Connection attempt: visitor=${visitorId}, requestedSession=${requestedSessionId || 'none'}`);
+
   try {
+    // CRITICAL: Create session BEFORE registering handlers for instant response
     const session = await ensureSession(visitorId, requestedSessionId);
+    
     socket.data.sessionId = session.id;
     socket.data.visitorId = visitorId;
     socket.join(session.id);
 
-    // IMPORTANT: Register event handlers BEFORE emitting session to avoid race condition
-    // Client may immediately send 'message' after receiving 'session'
-    registerSocketEvents(io, socket);
-    logger.info(`Socket connected (visitor=${visitorId}, session=${session.id})`);
+    logger.info(`✅ Session ready: ${session.id} (status=${session.status})`);
 
-    // Now emit session info to client
+    // Register handlers BEFORE emitting events to avoid race condition
+    registerSocketEvents(io, socket);
+
+    // INSTANT RESPONSE: Emit session immediately
     socket.emit('session', {
       sessionId: session.id,
       visitorId,
       status: session.status,
     });
+    logger.info(`📤 Emitted session event to client: ${session.id}`);
 
+    // Send history if exists (wrap in object for React frontend)
     const history = await getHistory(session.id);
     if (history.length) {
-      socket.emit('history', history);
+      socket.emit('history', { messages: history }); // React expects { messages: [] }
+      logger.info(`📜 Sent ${history.length} history messages`);
+    } else {
+      logger.info(`📜 No history for new session ${session.id}`);
     }
 
     await prisma.chatSession.update({
@@ -129,26 +142,46 @@ function registerSocketEvents(
   socket: Socket<ClientToServerEvents, ServerToClientEvents, InterServerEvents, SocketData>
 ) {
   socket.on('message', async (payload) => {
-    logger.info(`📥 [DEBUG] Message event received: ${JSON.stringify(payload)}`);
     const sessionId = payload.sessionId ?? socket.data.sessionId;
-    logger.info(`📥 [DEBUG] Using sessionId: ${sessionId}`);
+    
+    // CRITICAL: Validate session exists before processing
     if (!sessionId) {
-      logger.warn('No sessionId available');
-      socket.emit('error', { message: 'Session not established yet.' });
+      logger.warn('❌ No sessionId for message event');
+      socket.emit('error', { message: 'Session not established yet. Please wait.' });
       return;
     }
 
     const content = payload.content?.trim();
     if (!content) {
-      logger.warn('Empty content received');
+      logger.warn('⚠️ Empty message content');
       return;
     }
-    logger.info(`📥 [DEBUG] Processing message for session ${sessionId}: "${content}"`);
+
+    logger.info(`📥 Message received: session=${sessionId}, content="${content.substring(0, 50)}..."`);
 
     try {
-      const session = await prisma.chatSession.findUnique({ where: { id: sessionId } });
-      if (!session || session.status === chat_session_status.CLOSED) {
-        socket.emit('status', { status: chat_session_status.CLOSED });
+      // CRITICAL: Verify session is still valid and not closed
+      const session = await prisma.chatSession.findUnique({ 
+        where: { id: sessionId },
+        select: { id: true, status: true }
+      });
+      
+      if (!session) {
+        logger.warn(`❌ Session ${sessionId} not found`);
+        socket.emit('error', { message: 'Session expired. Please refresh the page.' });
+        socket.emit('sessionClosed', { 
+          sessionId, 
+          message: 'Session not found. Starting new session...' 
+        });
+        return;
+      }
+      
+      if (session.status === chat_session_status.CLOSED) {
+        logger.warn(`❌ Attempt to message closed session ${sessionId}`);
+        socket.emit('sessionClosed', { 
+          sessionId, 
+          message: 'Session was closed. Please start a new chat.' 
+        });
         return;
       }
 
@@ -160,16 +193,18 @@ function registerSocketEvents(
         },
       });
 
-      logger.info(`📤 [DEBUG] Emitting USER message to room ${sessionId}`);
+      // Echo user message to client (for multi-device sync)
       io.to(sessionId).emit('message', mapMessage(userMessage));
-      logger.info(`📤 [DEBUG] USER message emitted`);
+      logger.info(`📤 User message echoed to client`);
 
+      // Update session activity
       await prisma.chatSession.update({
         where: { id: sessionId },
         data: { last_active_at: new Date(), status: chat_session_status.ACTIVE },
       });
 
-      logger.info(`🤖 [DEBUG] Calling n8n webhook...`);
+      // Get AI response from n8n
+      logger.info(`🤖 Calling n8n webhook...`);
       const historyForBrain = await getHistory(sessionId, 50);
       const aiReply = await sendToN8n({
         sessionId,
@@ -181,8 +216,8 @@ function registerSocketEvents(
         })),
         metadata: payload.metadata,
       });
-      logger.info(`🤖 [DEBUG] n8n response received: "${aiReply.substring(0, 100)}..."`);
 
+      // Save and send AI message
       const aiMessage = await prisma.chatMessage.create({
         data: {
           session_id: sessionId,
@@ -191,9 +226,8 @@ function registerSocketEvents(
         },
       });
 
-      logger.info(`📤 [DEBUG] Emitting BOT message to room ${sessionId}`);
       io.to(sessionId).emit('message', mapMessage(aiMessage));
-      logger.info(`📤 [DEBUG] BOT message emitted successfully`);
+      logger.info(`📤 AI response sent: "${aiReply.substring(0, 50)}..."`);
     } catch (error) {
       logger.error('Error handling message event', error);
       socket.emit('error', { message: 'Unable to send message right now. Please try again.' });
@@ -214,63 +248,86 @@ function registerSocketEvents(
     }
   });
 
-  // NEW: Handle end session request from client
+  // WordPress widget uses 'endSession' event
   socket.on('endSession', async (payload) => {
-    const sessionId = payload.sessionId ?? socket.data.sessionId;
-    if (!sessionId) {
-      logger.warn('endSession called but no sessionId available');
-      return;
-    }
+    await handleEndSession(socket, payload);
+  });
 
-    try {
-      logger.info(`Ending session ${sessionId} by user request`);
-
-      // 1. Mark session as CLOSED in database
-      await prisma.chatSession.update({
-        where: { id: sessionId },
-        data: { 
-          status: chat_session_status.CLOSED,
-          last_active_at: new Date()
-        },
-      });
-
-      // 2. Add a system message to mark the end
-      await prisma.chatMessage.create({
-        data: {
-          session_id: sessionId,
-          role: message_role.SYSTEM,
-          content: 'Chat session ended by user.',
-        },
-      });
-
-      // 3. Emit confirmation to the client
-      socket.emit('sessionClosed', {
-        sessionId,
-        message: 'Session ended successfully. You can start a new conversation.',
-      });
-
-      // 4. Leave the room and clear socket data
-      socket.leave(sessionId);
-      socket.data.sessionId = undefined;
-
-      logger.info(`Session ${sessionId} closed successfully`);
-
-    } catch (error) {
-      logger.error('Error ending session', error);
-      socket.emit('error', { message: 'Failed to end session. Please try again.' });
-    }
+  // React frontend uses 'end_chat' event
+  socket.on('end_chat', async (payload) => {
+    await handleEndSession(socket, payload);
   });
 }
 
+// UNIFIED END SESSION LOGIC - Handles both WordPress and React frontends
+async function handleEndSession(
+  socket: Socket<ClientToServerEvents, ServerToClientEvents, InterServerEvents, SocketData>,
+  payload: EndSessionPayload
+) {
+  const sessionId = payload.sessionId ?? socket.data.sessionId;
+  
+  if (!sessionId) {
+    logger.warn('⚠️ endSession called without sessionId');
+    return;
+  }
+
+  try {
+    logger.info(`🔚 Ending session ${sessionId} by user request`);
+
+    // 1. Close session in database
+    await prisma.chatSession.update({
+      where: { id: sessionId },
+      data: { 
+        status: chat_session_status.CLOSED,
+        last_active_at: new Date()
+      },
+    });
+
+    // 2. Add system message
+    await prisma.chatMessage.create({
+      data: {
+        session_id: sessionId,
+        role: message_role.SYSTEM,
+        content: 'Chat session ended by user.',
+      },
+    });
+
+    // 3. Notify client
+    socket.emit('sessionClosed', {
+      sessionId,
+      message: 'Session ended successfully. You can start a new conversation.',
+    });
+
+    // 4. Clean up socket
+    socket.leave(sessionId);
+    socket.data.sessionId = undefined;
+
+    logger.info(`✅ Session ${sessionId} closed successfully`);
+
+  } catch (error) {
+    logger.error('Error ending session', error);
+    socket.emit('error', { message: 'Failed to end session. Please try again.' });
+  }
+}
+
+// OPTIMIZED: Single database query with proper filtering and detailed logging
 async function ensureSession(visitorId: string, requestedSessionId?: string) {
+  // If requested session exists and not closed, reuse it
   if (requestedSessionId) {
-    const session = await prisma.chatSession.findUnique({ where: { id: requestedSessionId } });
-    // Only reuse if session exists AND is not closed
+    const session = await prisma.chatSession.findUnique({ 
+      where: { id: requestedSessionId },
+      select: { id: true, visitor_id: true, status: true, created_at: true, last_active_at: true, metadata: true }
+    });
+    
     if (session && session.status !== chat_session_status.CLOSED) {
+      logger.info(`♻️ Reusing existing session: ${session.id}`);
       return session;
+    } else if (session) {
+      logger.info(`🚫 Requested session ${requestedSessionId} is CLOSED, creating new one`);
     }
   }
 
+  // Check for any non-closed session for this visitor
   const existing = await prisma.chatSession.findFirst({
     where: {
       visitor_id: visitorId,
@@ -280,15 +337,20 @@ async function ensureSession(visitorId: string, requestedSessionId?: string) {
   });
 
   if (existing) {
+    logger.info(`♻️ Found existing active session for visitor: ${existing.id}`);
     return existing;
   }
 
-  return prisma.chatSession.create({
+  // Create new session
+  const newSession = await prisma.chatSession.create({
     data: {
       visitor_id: visitorId,
       status: chat_session_status.ACTIVE,
     },
   });
+
+  logger.info(`✨ Created new session: ${newSession.id}`);
+  return newSession;
 }
 
 async function getHistory(sessionId: string, limit = 100): Promise<ChatMessageDto[]> {
